@@ -36,7 +36,11 @@ async function main() {
           throw err;
         }
 
+        db.run(`BEGIN TRANSACTION`);
+
         insertLogsFromFiles(db, () => {
+          db.run(`COMMIT`);
+
           db.get(`SELECT count(*) FROM logs`, (err, row) => {
             if (err) {
               throw err;
@@ -53,38 +57,48 @@ async function main() {
 }
 
 function insertLogsFromFiles(db, callback) {
-  const promises = [];
+  db.parallelize(() => {
+    const promises = [];
 
-  // For each file, start an `insertLogsFromFile` job, and add a promise to the
-  // list of promises we're tracking.
-  const walker = walk(logsPath, (path, stat) =>
-    promises.push(insertLogsFromFile(db, path, stat))
-  );
+    const insertLogStmt = db.prepare(`
+      INSERT INTO logs (eventId, eventTime, outfitId, imageSize, host, ipAddress, userAgent, awsRegion)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertLog = util.promisify((...args) => insertLogStmt.run(...args));
 
-  // Once we've walked all the files, wait for all the promises to finish, then
-  // we're done!
-  walker.on("end", () => Promise.all(promises).then(callback));
+    // For each file, start an `insertLogsFromFile` job, and add a promise to the
+    // list of promises we're tracking.
+    const walker = walk(logsPath, (path, stat) =>
+      promises.push(
+        insertLogsFromFile(insertLog, path, stat).catch((err) => {
+          console.error(`Error reading file ${path}`, err);
+        })
+      )
+    );
+
+    // Once we've walked all the files, wait for all the promises to finish, then
+    // we're done!
+    walker.on("end", () =>
+      Promise.all(promises).then(() => {
+        insertLogStmt.finalize();
+        callback();
+      })
+    );
+  });
 }
 
-async function insertLogsFromFile(db, path, stat) {
+async function insertLogsFromFile(insertLog, path, stat) {
+  console.log(`[${path}] Start`);
   const isLogFile = stat.isFile() && path.endsWith(".json.gz");
   if (!isLogFile) {
     return;
   }
 
-  let logs;
-  try {
-    const gzippedBody = await fs.readFile(path, null);
-    const jsonBody = await gunzip(gzippedBody);
-    logs = JSON.parse(jsonBody);
-  } catch (e) {
-    console.error(`Error reading ${path}:`, e);
-  }
+  const gzippedBody = await fs.readFile(path, null);
+  const jsonBody = await gunzip(gzippedBody);
+  const logs = JSON.parse(jsonBody);
 
-  const insertLogStmt = db.prepare(`
-    INSERT INTO logs (eventId, eventTime, outfitId, imageSize, host, ipAddress, userAgent, awsRegion)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  console.log(`[${path}] DB`);
 
   const promises = [];
   for (const record of logs.Records) {
@@ -98,30 +112,21 @@ async function insertLogsFromFile(db, path, stat) {
     }
 
     promises.push(
-      new Promise((resolve) =>
-        insertLogStmt.run(
-          record.eventID,
-          record.eventTime,
-          parsedKey.outfitId,
-          parsedKey.imageSize,
-          record.requestParameters.Host,
-          record.sourceIPAddress,
-          record.userAgent,
-          record.awsRegion,
-          (err) => {
-            if (err) {
-              console.error(`Error saving event ${record.eventID}:`, err);
-            }
-
-            resolve();
-          }
-        )
-      )
+      insertLog([
+        record.eventID,
+        record.eventTime,
+        parsedKey.outfitId,
+        parsedKey.imageSize,
+        record.requestParameters.Host,
+        record.sourceIPAddress,
+        record.userAgent,
+        record.awsRegion,
+      ])
     );
   }
 
   await Promise.all(promises);
-  insertLogStmt.finalize();
+  console.log(`[${path}] Done`);
 }
 
 const S3_KEY_PATTERN =
