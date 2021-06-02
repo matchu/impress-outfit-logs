@@ -6,7 +6,8 @@
   "private": true,
   "scripts": {
     "download-logs": "aws s3 sync s3://openneo-uploads-aws-cloudtrail-logs/AWSLogs/762705786595/CloudTrail/ logs",
-    "build-db": "node build-db.js"
+    "build-db": "node build-db.js",
+    "db": "sqlite3 db.sqlite3"
   },
   "dependencies": {
     "sqlite3": "^5.0.2",
