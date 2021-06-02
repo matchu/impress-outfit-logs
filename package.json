@@ -1,0 +1,16 @@
+{
+  "name": "impress-outfit-logs",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "none",
+  "private": true,
+  "scripts": {
+    "download-logs": "aws s3 sync s3://openneo-uploads-aws-cloudtrail-logs/AWSLogs/762705786595/CloudTrail/ logs",
+    "build-db": "node build-db.js"
+  },
+  "dependencies": {
+    "sqlite3": "^5.0.2",
+    "trash": "^7.1.1",
+    "walkdir": "^0.4.1"
+  }
+}
