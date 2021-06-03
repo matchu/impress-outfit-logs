@@ -32,22 +32,17 @@ async function main() {
 }
 
 async function backupImage(s3, key) {
-  let image;
-  try {
-    image = await s3.getObject({ Key: key }).promise();
-  } catch (err) {
-    if (err.code === "NoSuchKey") {
-      console.error(`Key ${key} not found`);
-      return 1;
-    }
-    throw err;
+  const tagging = await loadImageTagging(s3, key);
+  if (!tagging) {
+    console.error(`[ERRR, ${key}] Image not found`);
+    return;
   }
 
-  await saveBackupIfNotAlreadyDone(s3, key, image);
-  await compressOriginalIfNotAlreadyDone(s3, key, image);
+  await saveBackupIfNotAlreadyDone(s3, key);
+  await compressOriginalIfNotAlreadyDone(s3, key, tagging);
 }
 
-async function saveBackupIfNotAlreadyDone(s3, key, image) {
+async function saveBackupIfNotAlreadyDone(s3, key) {
   const backupKey = key + ".bkup";
 
   if (!force) {
@@ -58,38 +53,42 @@ async function saveBackupIfNotAlreadyDone(s3, key, image) {
         console.warn(
           `[WARN, ${key}] Skipping backup, unexpected DTI-Outfit-Image-Kind: ${backupTagging["DTI-Outfit-Image-Kind"]}`
         );
+        return;
       } else {
         console.info(`[BKUP, ${key}] Backup already exists, skipping`);
+        return;
       }
-      return;
     }
   }
 
   await s3
-    .putObject({
+    .copyObject({
       Key: backupKey,
-      Body: image.Body,
+      CopySource: `/openneo-uploads/${key}`,
       ContentType: "image/png",
       Tagging: "DTI-Outfit-Image-Kind=backup",
+      TaggingDirective: "REPLACE",
       StorageClass: "GLACIER",
     })
     .promise();
   console.info(`[BKUP, ${key}] Saved backup to ${backupKey}`);
 }
 
-async function compressOriginalIfNotAlreadyDone(s3, key, image) {
+async function compressOriginalIfNotAlreadyDone(s3, key, tagging) {
   if (!force) {
     // Check the tags of the original image. We'll only proceed if there is no
     // DTI-Outfit-Image-Kind tag. (If it's already marked as compressed, then
     // we've done this before, and we can skip it! If it's marked with an
     // unfamiliar tag, show a warning and skip out of caution.)
-    const tagging = await loadImageTagging(s3, key);
     if (!tagging) {
-      throw new Error(
-        `[ERRR, ${key}] Image existed earlier, but tagging not found now`
-      );
+      throw new Error(`[ERRR, ${key}] Image not found`);
     } else if (tagging["DTI-Outfit-Image-Kind"] === "compressed") {
       console.info(`[CMPR, ${key}] Original is already compressed, skipping`);
+      return;
+    } else if (tagging["DTI-Outfit-Image-Kind"] === "compression-failed") {
+      console.info(
+        `[CMPR, ${key}] Original previously failed to compress, skipping`
+      );
       return;
     } else if (
       tagging["DTI-Outfit-Image-Kind"] &&
@@ -102,7 +101,23 @@ async function compressOriginalIfNotAlreadyDone(s3, key, image) {
     }
   }
 
-  const quanter = new PngQuant([256, "--quality", "60-80"]);
+  let image;
+  try {
+    image = await s3.getObject({ Key: key }).promise();
+  } catch (err) {
+    if (err.code === "NoSuchKey") {
+      console.error(`Key ${key} not found`);
+      return 1;
+    }
+    throw err;
+  }
+
+  // We instruct the algorithm to target 80% quality, but we'll accept down
+  // to 40% quality. Sometimes it won't be possible to compress the image
+  // without decreasing the quality further (in which case, the algorithm
+  // might yield an image *larger* than the original). In that situation,
+  // we'd rather just keep the larger version, than go *so* low in quality!
+  const quanter = new PngQuant([256, "--quality", "40-80"]);
   const imageStream = stream.Readable.from(image.Body);
 
   // Stream the original image data into the quanter, and read the output
@@ -120,13 +135,37 @@ async function compressOriginalIfNotAlreadyDone(s3, key, image) {
     });
   });
 
-  const originalSize = humanFileSize(image.Body.length);
-  const compressedSize = humanFileSize(compressedImageData.length);
-  const compressedPercent = Math.round(
-    (compressedImageData.length / image.Body.length) * 100
-  );
+  const originalSize = image.Body.length;
+  const compressedSize = compressedImageData.length;
+  const compressedPercent = Math.round((compressedSize / originalSize) * 100);
+
+  // If we couldn't compress the image without compromising quality (so the
+  // compression algorithm yielded a larger image), don't write it, and instead
+  // set `DTI-Outfit-Image-Kind=compression-failed` on the image. This will help
+  // us know that it's done, and skip it if we try again later.
+  if (compressedSize > originalSize) {
+    console.warn(
+      `[WARN, ${key}] Skipping compression, was ` +
+        `${humanFileSize(originalSize)} -> ${humanFileSize(compressedSize)} ` +
+        `(${compressedPercent}% of original)`
+    );
+    await s3
+      .putObjectTagging({
+        Key: key,
+        Tagging: {
+          TagSet: [
+            { Key: "DTI-Outfit-Image-Kind", Value: "compression-failed" },
+          ],
+        },
+      })
+      .promise();
+    return;
+  }
+
   console.info(
-    `[CMPR, ${key}] Compressed image: ${originalSize} -> ${compressedSize} (${compressedPercent}% of original)`
+    `[CMPR, ${key}] Compressed image: ` +
+      `${humanFileSize(originalSize)} -> ${humanFileSize(compressedSize)} ` +
+      `(${compressedPercent}% of original)`
   );
 
   await s3
