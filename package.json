@@ -8,9 +8,12 @@
     "download-logs": "aws s3 sync s3://openneo-uploads-aws-cloudtrail-logs/AWSLogs/762705786595/CloudTrail/ logs",
     "build-db": "node build-db.js",
     "sync": "yarn download-logs && yarn build-db",
-    "db": "sqlite3 db.sqlite3"
+    "db": "sqlite3 db.sqlite3",
+    "backup-image": "node backup-image.js"
   },
   "dependencies": {
+    "aws-sdk": "^2.920.0",
+    "pngquant": "^4.0.0",
     "sqlite3": "^5.0.2",
     "trash": "^7.1.1",
     "walkdir": "^0.4.1"
