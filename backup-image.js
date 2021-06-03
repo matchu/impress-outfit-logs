@@ -1,7 +1,45 @@
 const stream = require("stream");
 
+const fetch = require("node-fetch");
 const S3 = require("aws-sdk/clients/s3");
 const PngQuant = require("pngquant");
+const gql = require("graphql-tag");
+const { print: graphqlPrint } = require("graphql/language/printer");
+
+const {
+  getVisibleLayers,
+  petAppearanceFragmentForGetVisibleLayers,
+  itemAppearanceFragmentForGetVisibleLayers,
+} = require("./lib/getVisibleLayers");
+const { renderOutfitImage } = require("./lib/outfit-images");
+
+// Adapted from https://github.com/matchu/impress-2020/blob/f932498066d6a35a778db3cdf600de62be438c6e/api/outfitImage.js#L172
+// Only change is to request all the sizes!
+const GRAPHQL_QUERY = gql`
+  query ApiOutfitImage($outfitId: ID!) {
+    outfit(id: $outfitId) {
+      petAppearance {
+        layers {
+          imageUrl600: imageUrl(size: SIZE_600)
+          imageUrl300: imageUrl(size: SIZE_300)
+          imageUrl150: imageUrl(size: SIZE_150)
+        }
+        ...PetAppearanceForGetVisibleLayers
+      }
+      itemAppearances {
+        layers {
+          imageUrl600: imageUrl(size: SIZE_600)
+          imageUrl300: imageUrl(size: SIZE_300)
+          imageUrl150: imageUrl(size: SIZE_150)
+        }
+        ...ItemAppearanceForGetVisibleLayers
+      }
+    }
+  }
+  ${petAppearanceFragmentForGetVisibleLayers}
+  ${itemAppearanceFragmentForGetVisibleLayers}
+`;
+const GRAPHQL_QUERY_STRING = graphqlPrint(GRAPHQL_QUERY);
 
 const force = process.argv.includes("--force");
 
@@ -18,20 +56,47 @@ async function main() {
     region: "us-east-1",
   });
 
-  const pid = outfitId.padStart(9, "0");
-  const keyPrefix =
-    `outfits/${pid.substr(0, 3)}` +
-    `/${pid.substr(3, 3)}` +
-    `/${pid.substr(6, 3)}`;
+  let outfitDataPromise;
+  const getOutfitData = () => {
+    if (!outfitDataPromise) {
+      outfitDataPromise = fetch(
+        "https://impress-2020.openneo.net/api/graphql",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            query: GRAPHQL_QUERY_STRING,
+            variables: { outfitId },
+          }),
+        }
+      ).then((res) => res.json());
+    }
+    return outfitDataPromise;
+  };
 
   await Promise.all([
-    backupImage(s3, keyPrefix + "/preview.png"),
-    backupImage(s3, keyPrefix + "/medium_preview.png"),
-    backupImage(s3, keyPrefix + "/small_preview.png"),
+    backupImage(s3, outfitId, 600, getOutfitData),
+    backupImage(s3, outfitId, 300, getOutfitData),
+    backupImage(s3, outfitId, 150, getOutfitData),
   ]);
 }
 
-async function backupImage(s3, key) {
+const SIZE_TO_FILENAME_MAP = {
+  600: "preview.png",
+  300: "medium_preview.png",
+  150: "small_preview.png",
+};
+
+async function backupImage(s3, outfitId, size, getOutfitData) {
+  const pid = outfitId.padStart(9, "0");
+  const key =
+    `outfits/${pid.substr(0, 3)}` +
+    `/${pid.substr(3, 3)}` +
+    `/${pid.substr(6, 3)}` +
+    `/${SIZE_TO_FILENAME_MAP[size]}`;
+
   const tagging = await loadImageTagging(s3, key);
   if (!tagging) {
     console.error(`[ERRR, ${key}] Image not found`);
@@ -39,7 +104,7 @@ async function backupImage(s3, key) {
   }
 
   await saveBackupIfNotAlreadyDone(s3, key);
-  await compressOriginalIfNotAlreadyDone(s3, key, tagging);
+  await compressOriginalIfNotAlreadyDone(s3, key, size, tagging, getOutfitData);
 }
 
 async function saveBackupIfNotAlreadyDone(s3, key) {
@@ -74,7 +139,13 @@ async function saveBackupIfNotAlreadyDone(s3, key) {
   console.info(`[BKUP, ${key}] Saved backup to ${backupKey}`);
 }
 
-async function compressOriginalIfNotAlreadyDone(s3, key, tagging) {
+async function compressOriginalIfNotAlreadyDone(
+  s3,
+  key,
+  size,
+  tagging,
+  getOutfitData
+) {
   if (!force) {
     // Check the tags of the original image. We'll only proceed if there is no
     // DTI-Outfit-Image-Kind tag. (If it's already marked as compressed, then
@@ -101,15 +172,29 @@ async function compressOriginalIfNotAlreadyDone(s3, key, tagging) {
     }
   }
 
-  let image;
-  try {
-    image = await s3.getObject({ Key: key }).promise();
-  } catch (err) {
-    if (err.code === "NoSuchKey") {
-      console.error(`Key ${key} not found`);
-      return 1;
-    }
-    throw err;
+  const { data, errors } = await getOutfitData();
+  if (errors && errors.length > 0) {
+    console.error(`[ERRR, ${key}] GraphQL outfit query failed:`, errors);
+    return;
+  }
+  if (!data.outfit) {
+    console.error(
+      `[ERRR, ${key}] GraphQL outfit query failed: ${outfitId} not found`
+    );
+    return;
+  }
+
+  const { petAppearance, itemAppearances } = data.outfit;
+  const visibleLayers = getVisibleLayers(petAppearance, itemAppearances)
+    .sort((a, b) => a.depth - b.depth)
+    .map((layer) => layer["imageUrl" + size]);
+
+  const { image, status } = await renderOutfitImage(visibleLayers, size);
+  if (status !== "success") {
+    console.error(
+      `[ERRR, ${key}] Could not render outfit image. Status: ${status}`
+    );
+    return;
   }
 
   // We instruct the algorithm to target 80% quality, but we'll accept down
@@ -118,7 +203,7 @@ async function compressOriginalIfNotAlreadyDone(s3, key, tagging) {
   // might yield an image *larger* than the original). In that situation,
   // we'd rather just keep the larger version, than go *so* low in quality!
   const quanter = new PngQuant([256, "--quality", "40-80"]);
-  const imageStream = stream.Readable.from(image.Body);
+  const imageStream = stream.Readable.from(image);
 
   // Stream the original image data into the quanter, and read the output
   // chunks from the stream one at a time, into a new Buffer.
@@ -135,30 +220,35 @@ async function compressOriginalIfNotAlreadyDone(s3, key, tagging) {
     });
   });
 
-  const originalSize = image.Body.length;
+  const originalSize = image.length;
   const compressedSize = compressedImageData.length;
   const compressedPercent = Math.round((compressedSize / originalSize) * 100);
 
   // If we couldn't compress the image without compromising quality (so the
   // compression algorithm yielded a larger image), don't write it, and instead
   // set `DTI-Outfit-Image-Kind=compression-failed` on the image. This will help
-  // us know that it's done, and skip it if we try again later.
+  // us know that it's done, and skip it if we try again later. We also want to
+  // move it to STANDARD_IA in this case, regardless of compression!
   if (compressedSize > originalSize) {
     console.warn(
       `[WARN, ${key}] Skipping compression, was ` +
         `${humanFileSize(originalSize)} -> ${humanFileSize(compressedSize)} ` +
         `(${compressedPercent}% of original)`
     );
+
+    // To update the tags and the storage class, copy the object over itself.
     await s3
-      .putObjectTagging({
+      .copyObject({
         Key: key,
-        Tagging: {
-          TagSet: [
-            { Key: "DTI-Outfit-Image-Kind", Value: "compression-failed" },
-          ],
-        },
+        CopySource: `/openneo-uploads/${key}`,
+        Tagging: "DTI-Outfit-Image-Kind=compression-failed",
+        TaggingDirective: "REPLACE",
+        // We ran the numbers, and our request counts aren't even close to high enough
+        // for STANDARD to be better for us!
+        StorageClass: "STANDARD_IA",
       })
       .promise();
+
     return;
   }
 
@@ -175,16 +265,9 @@ async function compressOriginalIfNotAlreadyDone(s3, key, tagging) {
       ContentType: "image/png",
       ACL: "public-read",
       Tagging: "DTI-Outfit-Image-Kind=compressed",
-      // TODO: Consider `StorageClass: "STANDARD_IA"… The gist is that it
-      //       would cut storage costs in half, but double request costs,
-      //       and add 10% to data transfer costs. My hunch is actually
-      //       that, once I clear out the storage to only include
-      //       relatively frequently-accessed things, and compress them,
-      //       this won't be a great trade anymore? We can migrate them
-      //       later if that turns out to be the case.
-      // TODO: But we probably want infrequent access for the "Not Found"
-      //       placeholder images we're gonna add, because we have no
-      //       real reason to believe they'll be accessed hardly *ever*!
+      // We ran the numbers, and our request counts aren't even close to high enough
+      // for STANDARD to be better for us!
+      StorageClass: "STANDARD_IA",
     })
     .promise();
   console.info(`[SAVE, ${key}] Saved compressed image to ${key}`);
