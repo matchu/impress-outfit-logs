@@ -106,6 +106,13 @@ async function insertLogsFromFile(insertLog, path, stat) {
       continue;
     }
 
+    // Ignore our own aws-sdk accesses from backups etc!
+    // We could also filter them out of queries, but we pretty much
+    // *always* want to, so this makes analysis easier.
+    if (record.userAgent.includes("aws-sdk")) {
+      continue;
+    }
+
     const parsedKey = parseS3Key(record.requestParameters.key);
     if (!parsedKey) {
       continue;
