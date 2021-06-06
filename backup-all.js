@@ -1,6 +1,7 @@
 const S3 = require("aws-sdk/clients/s3");
 const PromisePool = require("es6-promise-pool");
 const promiseRetry = require("promise-retry");
+const { timeout } = require("promise-timeout");
 
 const { backupImage, loadOutfitData } = require("./backup-image");
 const LRUCache = require("lru-cache");
@@ -24,7 +25,7 @@ async function main() {
     try {
       keys = await promiseRetry(
         (retry, number) =>
-          getImageKeys(s3, lastKey).catch((err) => {
+          timeout(getImageKeys(s3, lastKey), 5000).catch((err) => {
             console.warn(
               `Error loading keys from S3, retrying (StartAfter=${lastKey}, retry=${number})`,
               err
@@ -143,8 +144,9 @@ async function backupImageWithRetries(s3, key) {
     (retry, number) => {
       // Read the outfit ID segments from the key, join them, and strip leading 0s.
       const outfitId = String(Number(key.split("/").slice(1, 4).join("")));
-      return backupImage(s3, key, () =>
-        loadOutfitDataWithCaching(outfitId)
+      return timeout(
+        backupImage(s3, key, () => loadOutfitDataWithCaching(outfitId)),
+        10000
       ).catch((err) => {
         console.error(`Error backing up ${key} (retry=${number}):`, err);
         retry(err);
