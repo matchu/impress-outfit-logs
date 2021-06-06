@@ -16,11 +16,20 @@ const { renderOutfitImage } = require("./lib/outfit-images");
 // HACK: Use Node's testing APIs to be able to log custom trace
 //       events. I… genuinely didn't find a better way to do
 //       local nodejs custom tracing??
+//
+// To enable tracing, run this with:
+//     node --expose-internals --trace-event-categories app
+//
+// Without that, the require will throw an error, so the trace
+// functions will be no-ops!
 let trace;
 let withTrace;
 try {
   const { internalBinding } = require("internal/test/binding");
   const rawTrace = internalBinding("trace_events").trace;
+
+  // `trace` lets you wrap an async block with start/end trace events!
+  // Like: `await trace("fetchThatOneWebpage", {url}, () => fetch(url))`
   let nextTraceId = 0;
   trace = async (eventName, traceArgs, fn) => {
     let traceId = nextTraceId++;
@@ -31,6 +40,11 @@ try {
       rawTrace("e".charCodeAt(0), "app", eventName, traceId, traceArgs);
     }
   };
+
+  // `withTrace` lets you wrap an async function with start/end trace
+  // events for every time you call it! First parameter is the function,
+  // second parameter is a function to transform the arguments into an
+  // object of safe, serializable arguments to log with the trace.
   withTrace =
     (fn, getTraceArgsFromFnArgs, name = null) =>
     (...args) =>
