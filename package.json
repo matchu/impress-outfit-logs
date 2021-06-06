@@ -9,15 +9,19 @@
     "build-db": "node build-db.js",
     "sync": "yarn download-logs && yarn build-db",
     "db": "sqlite3 db.sqlite3",
-    "backup-image": "node backup-image.js"
+    "backup-image": "node backup-image.js",
+    "backup-all": "node backup-all.js"
   },
   "dependencies": {
+    "@supercharge/promise-pool": "^1.7.0",
     "aws-sdk": "^2.920.0",
     "canvas": "^2.8.0",
     "graphql": "^15.5.0",
     "graphql-tag": "^2.12.4",
+    "lru-cache": "^6.0.0",
     "node-fetch": "^2.6.1",
     "pngquant": "^4.0.0",
+    "promise-retry": "^2.0.1",
     "sqlite3": "^5.0.2",
     "trash": "^7.1.1",
     "walkdir": "^0.4.1"

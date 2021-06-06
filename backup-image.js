@@ -57,54 +57,57 @@ async function main() {
   });
 
   let outfitDataPromise;
-  const getOutfitData = () => {
+  const getOutfitData = async () => {
     if (!outfitDataPromise) {
-      outfitDataPromise = fetch(
-        "https://impress-2020.openneo.net/api/graphql",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            query: GRAPHQL_QUERY_STRING,
-            variables: { outfitId },
-          }),
-        }
-      ).then((res) => res.json());
+      outfitDataPromise = loadOutfitData(outfitId);
     }
-    return outfitDataPromise;
+    return await outfitDataPromise;
+  };
+
+  const pid = outfitId.padStart(9, "0");
+  const baseKey =
+    `outfits/${pid.substr(0, 3)}` +
+    `/${pid.substr(3, 3)}` +
+    `/${pid.substr(6, 3)}`;
+
+  const handleError = (key, err) => {
+    console.error(`[ERRR, ${key}]`, err);
   };
 
   await Promise.all([
-    backupImage(s3, outfitId, 600, getOutfitData),
-    backupImage(s3, outfitId, 300, getOutfitData),
-    backupImage(s3, outfitId, 150, getOutfitData),
+    backupImage(s3, baseKey + "/preview.png", getOutfitData).catch((err) =>
+      handleError(baseKey + "/preview.png", err)
+    ),
+    backupImage(s3, baseKey + "/medium_preview.png", getOutfitData).catch(
+      (err) => handleError(baseKey + "/medium_preview.png", err)
+    ),
+    backupImage(s3, baseKey + "/small_preview.png", getOutfitData).catch(
+      (err) => handleError(baseKey + "/small_preview.png", err)
+    ),
   ]);
 }
 
-const SIZE_TO_FILENAME_MAP = {
-  600: "preview.png",
-  300: "medium_preview.png",
-  150: "small_preview.png",
+const FILENAME_TO_SIZE_MAP = {
+  "preview.png": 600,
+  "medium_preview.png": 300,
+  "small_preview.png": 150,
 };
 
-async function backupImage(s3, outfitId, size, getOutfitData) {
-  const pid = outfitId.padStart(9, "0");
-  const key =
-    `outfits/${pid.substr(0, 3)}` +
-    `/${pid.substr(3, 3)}` +
-    `/${pid.substr(6, 3)}` +
-    `/${SIZE_TO_FILENAME_MAP[size]}`;
-
+async function backupImage(s3, key, getOutfitData) {
   const tagging = await loadImageTagging(s3, key);
   if (!tagging) {
-    console.error(`[ERRR, ${key}] Image not found`);
-    return;
+    throw new Error(`Image not found`);
   }
 
-  await saveBackupIfNotAlreadyDone(s3, key);
-  await compressOriginalIfNotAlreadyDone(s3, key, size, tagging, getOutfitData);
+  const didSaveBackup = await saveBackupIfNotAlreadyDone(s3, key);
+  const didCompressOriginal = await compressOriginalIfNotAlreadyDone(
+    s3,
+    key,
+    tagging,
+    getOutfitData
+  );
+
+  return didSaveBackup || didCompressOriginal;
 }
 
 async function saveBackupIfNotAlreadyDone(s3, key) {
@@ -118,10 +121,10 @@ async function saveBackupIfNotAlreadyDone(s3, key) {
         console.warn(
           `[WARN, ${key}] Skipping backup, unexpected DTI-Outfit-Image-Kind: ${backupTagging["DTI-Outfit-Image-Kind"]}`
         );
-        return;
+        return false;
       } else {
         console.info(`[BKUP, ${key}] Backup already exists, skipping`);
-        return;
+        return false;
       }
     }
   }
@@ -137,12 +140,12 @@ async function saveBackupIfNotAlreadyDone(s3, key) {
     })
     .promise();
   console.info(`[BKUP, ${key}] Saved backup to ${backupKey}`);
+  return true;
 }
 
 async function compressOriginalIfNotAlreadyDone(
   s3,
   key,
-  size,
   tagging,
   getOutfitData
 ) {
@@ -152,15 +155,15 @@ async function compressOriginalIfNotAlreadyDone(
     // we've done this before, and we can skip it! If it's marked with an
     // unfamiliar tag, show a warning and skip out of caution.)
     if (!tagging) {
-      throw new Error(`[ERRR, ${key}] Image not found`);
+      throw new Error(`Image not found`);
     } else if (tagging["DTI-Outfit-Image-Kind"] === "compressed") {
       console.info(`[CMPR, ${key}] Original is already compressed, skipping`);
-      return;
+      return false;
     } else if (tagging["DTI-Outfit-Image-Kind"] === "compression-failed") {
       console.info(
         `[CMPR, ${key}] Original previously failed to compress, skipping`
       );
-      return;
+      return false;
     } else if (
       tagging["DTI-Outfit-Image-Kind"] &&
       tagging["DTI-Outfit-Image-Kind"] !== "compressed"
@@ -168,21 +171,20 @@ async function compressOriginalIfNotAlreadyDone(
       console.warn(
         `[WARN, ${key}] Skipping compression, unexpected DTI-Outfit-Image-Kind: ${tagging["DTI-Outfit-Image-Kind"]}`
       );
-      return;
+      return false;
     }
   }
 
   const { data, errors } = await getOutfitData();
   if (errors && errors.length > 0) {
-    console.error(`[ERRR, ${key}] GraphQL outfit query failed:`, errors);
-    return;
+    throw new Error(`GraphQL outfit query failed:\n` + JSON.stringify(errors));
   }
   if (!data.outfit) {
-    console.error(
-      `[ERRR, ${key}] GraphQL outfit query failed: ${outfitId} not found`
-    );
-    return;
+    throw new Error(`GraphQL outfit query failed: ${outfitId} not found`);
   }
+
+  const filename = key.split("/").pop();
+  const size = FILENAME_TO_SIZE_MAP[filename];
 
   const { petAppearance, itemAppearances } = data.outfit;
   const visibleLayers = getVisibleLayers(petAppearance, itemAppearances)
@@ -191,10 +193,7 @@ async function compressOriginalIfNotAlreadyDone(
 
   const { image, status } = await renderOutfitImage(visibleLayers, size);
   if (status !== "success") {
-    console.error(
-      `[ERRR, ${key}] Could not render outfit image. Status: ${status}`
-    );
-    return;
+    throw new Error(`Could not render outfit image. Status: ${status}`);
   }
 
   // We instruct the algorithm to target 80% quality, but we'll accept down
@@ -250,7 +249,7 @@ async function compressOriginalIfNotAlreadyDone(
       })
       .promise();
 
-    return;
+    return true;
   }
 
   console.info(
@@ -272,6 +271,21 @@ async function compressOriginalIfNotAlreadyDone(
     })
     .promise();
   console.info(`[SAVE, ${key}] Saved compressed image to ${key}`);
+  return true;
+}
+
+async function loadOutfitData(outfitId) {
+  console.info(`[GQL] Loading outfit data for outfit ${outfitId}`);
+  return await fetch("https://impress-2020.openneo.net/api/graphql", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: GRAPHQL_QUERY_STRING,
+      variables: { outfitId },
+    }),
+  }).then((res) => res.json());
 }
 
 async function loadImageTagging(s3, key) {
@@ -316,9 +330,13 @@ function humanFileSize(bytes, si = false, dp = 1) {
   return bytes.toFixed(dp) + " " + units[u];
 }
 
-main()
-  .then((responseCode = 0) => process.exit(responseCode))
-  .catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+module.exports = { backupImage, loadOutfitData };
+
+if (require.main === module) {
+  main()
+    .then((responseCode = 0) => process.exit(responseCode))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}
