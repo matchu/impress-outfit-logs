@@ -241,6 +241,7 @@ async function compressOriginalIfNotAlreadyDone(
       .copyObject({
         Key: key,
         CopySource: `/openneo-uploads/${key}`,
+        ACL: "public-read",
         Tagging: "DTI-Outfit-Image-Kind=compression-failed",
         TaggingDirective: "REPLACE",
         // We ran the numbers, and our request counts aren't even close to high enough
