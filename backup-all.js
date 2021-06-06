@@ -1,5 +1,5 @@
 const S3 = require("aws-sdk/clients/s3");
-const PromisePool = require("@supercharge/promise-pool");
+const PromisePool = require("es6-promise-pool");
 const promiseRetry = require("promise-retry");
 
 const { backupImage, loadOutfitData } = require("./backup-image");
@@ -59,37 +59,28 @@ async function main() {
     numImageKeys += imageKeys.length;
     numImageBackupKeys += imageBackupKeys.length;
 
-    await PromisePool.withConcurrency(NUM_WORKERS)
-      .for(imageKeys)
-      .process((key) =>
-        promiseRetry(
-          (retry, number) => {
-            // Read the outfit ID segments from the key, join them, and strip leading 0s.
-            const outfitId = String(
-              Number(key.split("/").slice(1, 4).join(""))
-            );
-            return backupImage(s3, key, () =>
-              loadOutfitDataWithCaching(outfitId)
-            )
-              .then((didMakeChanges) => {
-                if (!didMakeChanges) {
-                  numImageKeyNoOps += 1;
-                }
-              })
-              .catch((err) => {
-                console.error(
-                  `Error backing up ${key} (retry=${number}):`,
-                  err
-                );
-                retry(err);
-              });
-          },
-          { retries: 5 }
-        ).catch((error) => {
-          console.error(`Error backing up ${key}, giving up:`, error);
-          backupFailures.push({ key, error });
-        })
-      );
+    let imageKeyIndex = 0;
+    const backupImagePromiseProducer = () => {
+      if (imageKeyIndex < imageKeys.length) {
+        const key = imageKeys[imageKeyIndex];
+        imageKeyIndex++;
+        return backupImageWithRetries(s3, key)
+          .then((didMakeChanges) => {
+            if (!didMakeChanges) {
+              numImageKeyNoOps += 1;
+            }
+          })
+          .catch((error) => {
+            console.error(`Error backing up ${key}, giving up:`, error);
+            backupFailures.push({ key, error });
+          });
+      } else {
+        return null;
+      }
+    };
+
+    const pool = new PromisePool(backupImagePromiseProducer, NUM_WORKERS);
+    await pool.start();
 
     lastKey = keys[keys.length - 1];
   }
@@ -145,6 +136,23 @@ async function loadOutfitDataWithCaching(outfitId) {
   const outfitDataPromise = loadOutfitData(outfitId);
   OUTFIT_DATA_PROMISES_CACHE.set(outfitId, outfitDataPromise);
   return await outfitDataPromise;
+}
+
+async function backupImageWithRetries(s3, key) {
+  return await promiseRetry(
+    (retry, number) => {
+      // Read the outfit ID segments from the key, join them, and strip leading 0s.
+      const outfitId = String(Number(key.split("/").slice(1, 4).join("")));
+      return backupImage(s3, key, () =>
+        loadOutfitDataWithCaching(outfitId)
+      ).catch((err) => {
+        console.error(`Error backing up ${key} (retry=${number}):`, err);
+        retry(err);
+        return false;
+      });
+    },
+    { retries: 5 }
+  );
 }
 
 main()

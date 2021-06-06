@@ -13,9 +13,9 @@
     "backup-all": "node backup-all.js"
   },
   "dependencies": {
-    "@supercharge/promise-pool": "^1.7.0",
     "aws-sdk": "^2.920.0",
     "canvas": "^2.8.0",
+    "es6-promise-pool": "^2.5.0",
     "graphql": "^15.5.0",
     "graphql-tag": "^2.12.4",
     "lru-cache": "^6.0.0",
