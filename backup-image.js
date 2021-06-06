@@ -13,6 +13,35 @@ const {
 } = require("./lib/getVisibleLayers");
 const { renderOutfitImage } = require("./lib/outfit-images");
 
+// HACK: Use Node's testing APIs to be able to log custom trace
+//       events. I… genuinely didn't find a better way to do
+//       local nodejs custom tracing??
+let trace;
+let withTrace;
+try {
+  const { internalBinding } = require("internal/test/binding");
+  const rawTrace = internalBinding("trace_events").trace;
+  let nextTraceId = 0;
+  trace = async (eventName, traceArgs, fn) => {
+    let traceId = nextTraceId++;
+    rawTrace("b".charCodeAt(0), "app", eventName, traceId, traceArgs);
+    try {
+      return await fn();
+    } finally {
+      rawTrace("e".charCodeAt(0), "app", eventName, traceId, traceArgs);
+    }
+  };
+  withTrace =
+    (fn, getTraceArgsFromFnArgs, name = null) =>
+    (...args) =>
+      trace(name || fn.name, getTraceArgsFromFnArgs(...args), () =>
+        fn(...args)
+      );
+} catch (e) {
+  trace = () => {};
+  withTrace = (fn) => fn;
+}
+
 // Adapted from https://github.com/matchu/impress-2020/blob/f932498066d6a35a778db3cdf600de62be438c6e/api/outfitImage.js#L172
 // Only change is to request all the sizes!
 const GRAPHQL_QUERY = gql`
@@ -109,6 +138,7 @@ async function backupImage(s3, key, getOutfitData) {
 
   return didSaveBackup || didCompressOriginal;
 }
+backupImage = withTrace(backupImage, (_, key) => ({ key }), "1. backupImage");
 
 async function saveBackupIfNotAlreadyDone(s3, key) {
   const backupKey = key + ".bkup";
@@ -129,19 +159,26 @@ async function saveBackupIfNotAlreadyDone(s3, key) {
     }
   }
 
-  await s3
-    .copyObject({
-      Key: backupKey,
-      CopySource: `/openneo-uploads/${key}`,
-      ContentType: "image/png",
-      Tagging: "DTI-Outfit-Image-Kind=backup",
-      TaggingDirective: "REPLACE",
-      StorageClass: "GLACIER",
-    })
-    .promise();
+  await trace("copyObject-backup", { key }, () =>
+    s3
+      .copyObject({
+        Key: backupKey,
+        CopySource: `/openneo-uploads/${key}`,
+        ContentType: "image/png",
+        Tagging: "DTI-Outfit-Image-Kind=backup",
+        TaggingDirective: "REPLACE",
+        StorageClass: "GLACIER",
+      })
+      .promise()
+  );
   console.info(`[BKUP, ${key}] Saved backup to ${backupKey}`);
   return true;
 }
+saveBackupIfNotAlreadyDone = withTrace(
+  saveBackupIfNotAlreadyDone,
+  (_, key) => ({ key }),
+  "2a. saveBackupIfNotAlreadyDone"
+);
 
 async function compressOriginalIfNotAlreadyDone(
   s3,
@@ -175,6 +212,89 @@ async function compressOriginalIfNotAlreadyDone(
     }
   }
 
+  const image = await buildOutfitImage(key, getOutfitData);
+  const compressedImageData = await compressImage(image);
+
+  const originalSize = image.length;
+  const compressedSize = compressedImageData.length;
+  const compressedPercent = Math.round((compressedSize / originalSize) * 100);
+
+  // If we couldn't compress the image without compromising quality (so the
+  // compression algorithm yielded a larger image), don't write it, and instead
+  // set `DTI-Outfit-Image-Kind=compression-failed` on the image. This will help
+  // us know that it's done, and skip it if we try again later. We also want to
+  // move it to STANDARD_IA in this case, regardless of compression!
+  if (compressedSize > originalSize) {
+    console.warn(
+      `[WARN, ${key}] Skipping compression, was ` +
+        `${humanFileSize(originalSize)} -> ${humanFileSize(compressedSize)} ` +
+        `(${compressedPercent}% of original)`
+    );
+
+    // To update the tags and the storage class, copy the object over itself.
+    await trace("copyObject-compressionFailed", { key }, () =>
+      s3
+        .copyObject({
+          Key: key,
+          CopySource: `/openneo-uploads/${key}`,
+          ACL: "public-read",
+          Tagging: "DTI-Outfit-Image-Kind=compression-failed",
+          TaggingDirective: "REPLACE",
+          // We ran the numbers, and our request counts aren't even close to high enough
+          // for STANDARD to be better for us!
+          StorageClass: "STANDARD_IA",
+        })
+        .promise()
+    );
+
+    return true;
+  }
+
+  console.info(
+    `[CMPR, ${key}] Compressed image: ` +
+      `${humanFileSize(originalSize)} -> ${humanFileSize(compressedSize)} ` +
+      `(${compressedPercent}% of original)`
+  );
+
+  await trace("putObject-compressed", { key }, () =>
+    s3
+      .putObject({
+        Key: key,
+        Body: compressedImageData,
+        ContentType: "image/png",
+        ACL: "public-read",
+        Tagging: "DTI-Outfit-Image-Kind=compressed",
+        // We ran the numbers, and our request counts aren't even close to high enough
+        // for STANDARD to be better for us!
+        StorageClass: "STANDARD_IA",
+      })
+      .promise()
+  );
+  console.info(`[SAVE, ${key}] Saved compressed image to ${key}`);
+  return true;
+}
+compressOriginalIfNotAlreadyDone = withTrace(
+  compressOriginalIfNotAlreadyDone,
+  (_, key) => ({ key }),
+  "2b. compressOriginalIfNotAlreadyDone"
+);
+
+async function loadOutfitData(outfitId) {
+  console.info(`[GQL] Loading outfit data for outfit ${outfitId}`);
+  return await fetch("https://impress-2020.openneo.net/api/graphql", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: GRAPHQL_QUERY_STRING,
+      variables: { outfitId },
+    }),
+  }).then((res) => res.json());
+}
+loadOutfitData = withTrace(loadOutfitData, (outfitId) => ({ outfitId }));
+
+async function buildOutfitImage(key, getOutfitData) {
   const { data, errors } = await getOutfitData();
   if (errors && errors.length > 0) {
     throw new Error(`GraphQL outfit query failed:\n` + JSON.stringify(errors));
@@ -191,11 +311,18 @@ async function compressOriginalIfNotAlreadyDone(
     .sort((a, b) => a.depth - b.depth)
     .map((layer) => layer["imageUrl" + size]);
 
-  const { image, status } = await renderOutfitImage(visibleLayers, size);
+  const { image, status } = await trace("renderOutfitImage", { key }, () =>
+    renderOutfitImage(visibleLayers, size)
+  );
   if (status !== "success") {
     throw new Error(`Could not render outfit image. Status: ${status}`);
   }
 
+  return image;
+}
+buildOutfitImage = withTrace(buildOutfitImage, (key) => ({ key }));
+
+async function compressImage(image) {
   // We instruct the algorithm to target 80% quality, but we'll accept down
   // to 40% quality. Sometimes it won't be possible to compress the image
   // without decreasing the quality further (in which case, the algorithm
@@ -219,74 +346,9 @@ async function compressOriginalIfNotAlreadyDone(
     });
   });
 
-  const originalSize = image.length;
-  const compressedSize = compressedImageData.length;
-  const compressedPercent = Math.round((compressedSize / originalSize) * 100);
-
-  // If we couldn't compress the image without compromising quality (so the
-  // compression algorithm yielded a larger image), don't write it, and instead
-  // set `DTI-Outfit-Image-Kind=compression-failed` on the image. This will help
-  // us know that it's done, and skip it if we try again later. We also want to
-  // move it to STANDARD_IA in this case, regardless of compression!
-  if (compressedSize > originalSize) {
-    console.warn(
-      `[WARN, ${key}] Skipping compression, was ` +
-        `${humanFileSize(originalSize)} -> ${humanFileSize(compressedSize)} ` +
-        `(${compressedPercent}% of original)`
-    );
-
-    // To update the tags and the storage class, copy the object over itself.
-    await s3
-      .copyObject({
-        Key: key,
-        CopySource: `/openneo-uploads/${key}`,
-        ACL: "public-read",
-        Tagging: "DTI-Outfit-Image-Kind=compression-failed",
-        TaggingDirective: "REPLACE",
-        // We ran the numbers, and our request counts aren't even close to high enough
-        // for STANDARD to be better for us!
-        StorageClass: "STANDARD_IA",
-      })
-      .promise();
-
-    return true;
-  }
-
-  console.info(
-    `[CMPR, ${key}] Compressed image: ` +
-      `${humanFileSize(originalSize)} -> ${humanFileSize(compressedSize)} ` +
-      `(${compressedPercent}% of original)`
-  );
-
-  await s3
-    .putObject({
-      Key: key,
-      Body: compressedImageData,
-      ContentType: "image/png",
-      ACL: "public-read",
-      Tagging: "DTI-Outfit-Image-Kind=compressed",
-      // We ran the numbers, and our request counts aren't even close to high enough
-      // for STANDARD to be better for us!
-      StorageClass: "STANDARD_IA",
-    })
-    .promise();
-  console.info(`[SAVE, ${key}] Saved compressed image to ${key}`);
-  return true;
+  return compressedImageData;
 }
-
-async function loadOutfitData(outfitId) {
-  console.info(`[GQL] Loading outfit data for outfit ${outfitId}`);
-  return await fetch("https://impress-2020.openneo.net/api/graphql", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: GRAPHQL_QUERY_STRING,
-      variables: { outfitId },
-    }),
-  }).then((res) => res.json());
-}
+compressImage = withTrace(compressImage, () => ({}));
 
 async function loadImageTagging(s3, key) {
   try {
@@ -304,6 +366,7 @@ async function loadImageTagging(s3, key) {
     }
   }
 }
+loadImageTagging = withTrace(loadImageTagging, (_, key) => ({ key }));
 
 // https://stackoverflow.com/a/14919494/107415
 function humanFileSize(bytes, si = false, dp = 1) {

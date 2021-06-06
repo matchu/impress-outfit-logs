@@ -2,3 +2,4 @@
 /logs
 /db.sqlite3
 /backup-all.log
+node_trace.1.log

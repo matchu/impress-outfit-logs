@@ -10,6 +10,7 @@
     "sync": "yarn download-logs && yarn build-db",
     "db": "sqlite3 db.sqlite3",
     "backup-image": "node backup-image.js",
+    "backup-image-trace": "node --expose-internals --trace-event-categories app backup-image.js 894911 --force",
     "backup-all": "node backup-all.js"
   },
   "dependencies": {
