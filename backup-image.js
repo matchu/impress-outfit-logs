@@ -192,7 +192,7 @@ async function saveBackupIfNotAlreadyDone(s3, key, backupKey, backupTagging) {
     }
   }
 
-  await trace("copyObject-backup", { key }, () =>
+  await trace("3b. copyObject-backup", { key }, () =>
     s3
       .copyObject({
         Key: backupKey,
@@ -210,7 +210,7 @@ async function saveBackupIfNotAlreadyDone(s3, key, backupKey, backupTagging) {
 saveBackupIfNotAlreadyDone = withTrace(
   saveBackupIfNotAlreadyDone,
   (_, key, backupKey) => ({ key, backupKey }),
-  "2a. saveBackupIfNotAlreadyDone"
+  "2b. saveBackupIfNotAlreadyDone"
 );
 
 async function buildNewImagesIfNotAlreadyDone(key, getOutfitData) {
@@ -297,7 +297,7 @@ async function replaceOriginalIfNotAlreadyDone(s3, key, tagging, getNewImages) {
     );
 
     // To update the tags and the storage class, copy the object over itself.
-    await trace("copyObject-compressionFailed", { key }, () =>
+    await trace("4f. copyObject-compressionFailed", { key }, () =>
       s3
         .copyObject({
           Key: key,
@@ -321,7 +321,7 @@ async function replaceOriginalIfNotAlreadyDone(s3, key, tagging, getNewImages) {
       `(${compressedPercent}% of original)`
   );
 
-  await trace("putObject-compressed", { key }, () =>
+  await trace("4e. putObject-compressed", { key }, () =>
     s3
       .putObject({
         Key: key,
@@ -358,7 +358,11 @@ async function loadOutfitData(outfitId) {
     }),
   }).then((res) => res.json());
 }
-loadOutfitData = withTrace(loadOutfitData, (outfitId) => ({ outfitId }));
+loadOutfitData = withTrace(
+  loadOutfitData,
+  (outfitId) => ({ outfitId }),
+  "4a. loadOutfitData"
+);
 
 async function buildOutfitImage(key, getOutfitData) {
   const { data, errors } = await getOutfitData();
@@ -377,7 +381,7 @@ async function buildOutfitImage(key, getOutfitData) {
     .sort((a, b) => a.depth - b.depth)
     .map((layer) => layer["imageUrl" + size]);
 
-  const { image, status } = await trace("renderOutfitImage", { key }, () =>
+  const { image, status } = await trace("4c. renderOutfitImage", { key }, () =>
     renderOutfitImage(visibleLayers, size)
   );
   if (status !== "success") {
@@ -386,7 +390,11 @@ async function buildOutfitImage(key, getOutfitData) {
 
   return image;
 }
-buildOutfitImage = withTrace(buildOutfitImage, (key) => ({ key }));
+buildOutfitImage = withTrace(
+  buildOutfitImage,
+  (key) => ({ key }),
+  "4b. buildOutfitImage"
+);
 
 async function compressImage(image) {
   // We instruct the algorithm to target 80% quality, but we'll accept down
@@ -414,7 +422,7 @@ async function compressImage(image) {
 
   return compressedImageData;
 }
-compressImage = withTrace(compressImage, () => ({}));
+compressImage = withTrace(compressImage, () => ({}), "4d. compressImage");
 
 async function loadImageTagging(s3, key) {
   try {
@@ -432,7 +440,11 @@ async function loadImageTagging(s3, key) {
     }
   }
 }
-loadImageTagging = withTrace(loadImageTagging, (_, key) => ({ key }));
+loadImageTagging = withTrace(
+  loadImageTagging,
+  (_, key) => ({ key }),
+  "3a. loadImageTagging"
+);
 
 // https://stackoverflow.com/a/14919494/107415
 function humanFileSize(bytes, si = false, dp = 1) {
