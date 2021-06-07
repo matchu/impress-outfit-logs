@@ -139,15 +139,29 @@ async function backupImage(s3, key, getOutfitData) {
     throw new Error(`Image not found`);
   }
 
-  const didSaveBackup = await saveBackupIfNotAlreadyDone(s3, key);
-  const didCompressOriginal = await compressOriginalIfNotAlreadyDone(
-    s3,
+  // NOTE: We preload the compressed image, even if we might not end up
+  //       using it (in the case of an error during backup). This helps us
+  //       parallelize things better, to not bottleneck on it!
+  const newImagesPromise = buildNewImagesIfNotAlreadyDone(
     key,
     tagging,
     getOutfitData
   );
 
-  return didSaveBackup || didCompressOriginal;
+  // First, back up the original image, before touching anything else.
+  const didSaveBackup = await saveBackupIfNotAlreadyDone(s3, key);
+
+  // Then, replace it with the new images.
+  const newImages = await newImagesPromise;
+  const didReplaceOriginal = await replaceOriginalIfNotAlreadyDone(
+    s3,
+    key,
+    newImages
+  );
+
+  // Return whether we made some kind of change, either in the backup
+  // or the replacement step.
+  return didSaveBackup || didReplaceOriginal;
 }
 backupImage = withTrace(backupImage, (_, key) => ({ key }), "1. backupImage");
 
@@ -191,12 +205,7 @@ saveBackupIfNotAlreadyDone = withTrace(
   "2a. saveBackupIfNotAlreadyDone"
 );
 
-async function compressOriginalIfNotAlreadyDone(
-  s3,
-  key,
-  tagging,
-  getOutfitData
-) {
+async function buildNewImagesIfNotAlreadyDone(key, tagging, getOutfitData) {
   if (!force) {
     // Check the tags of the original image. We'll only proceed if there is no
     // DTI-Outfit-Image-Kind tag. (If it's already marked as compressed, then
@@ -206,12 +215,12 @@ async function compressOriginalIfNotAlreadyDone(
       throw new Error(`Image not found`);
     } else if (tagging["DTI-Outfit-Image-Kind"] === "compressed") {
       console.info(`[CMPR, ${key}] Original is already compressed, skipping`);
-      return false;
+      return null;
     } else if (tagging["DTI-Outfit-Image-Kind"] === "compression-failed") {
       console.info(
         `[CMPR, ${key}] Original previously failed to compress, skipping`
       );
-      return false;
+      return null;
     } else if (
       tagging["DTI-Outfit-Image-Kind"] &&
       tagging["DTI-Outfit-Image-Kind"] !== "compressed"
@@ -219,15 +228,33 @@ async function compressOriginalIfNotAlreadyDone(
       console.warn(
         `[WARN, ${key}] Skipping compression, unexpected DTI-Outfit-Image-Kind: ${tagging["DTI-Outfit-Image-Kind"]}`
       );
-      return false;
+      return null;
     }
   }
 
-  const image = await buildOutfitImage(key, getOutfitData);
-  const compressedImageData = await compressImage(image);
+  const originalImage = await buildOutfitImage(key, getOutfitData);
+  const compressedImage = await compressImage(originalImage);
 
-  const originalSize = image.length;
-  const compressedSize = compressedImageData.length;
+  return { originalImage, compressedImage };
+}
+buildNewImagesIfNotAlreadyDone = withTrace(
+  buildNewImagesIfNotAlreadyDone,
+  (_, key) => ({ key }),
+  "2b. buildNewImagesIfNotAlreadyDone"
+);
+
+async function replaceOriginalIfNotAlreadyDone(s3, key, newImages) {
+  // `buildNewImageIfNotAlreadyDone` returns `null` if it was already done.
+  // In that case, we skip replacement, and `false` from here to tell the
+  // parent it was already done!
+  if (!newImages) {
+    return false;
+  }
+
+  const { originalImage, compressedImage } = newImages;
+
+  const originalSize = originalImage.length;
+  const compressedSize = compressedImage.length;
   const compressedPercent = Math.round((compressedSize / originalSize) * 100);
 
   // If we couldn't compress the image without compromising quality (so the
@@ -271,7 +298,7 @@ async function compressOriginalIfNotAlreadyDone(
     s3
       .putObject({
         Key: key,
-        Body: compressedImageData,
+        Body: compressedImage,
         ContentType: "image/png",
         ACL: "public-read",
         Tagging: "DTI-Outfit-Image-Kind=compressed",
@@ -281,13 +308,14 @@ async function compressOriginalIfNotAlreadyDone(
       })
       .promise()
   );
+
   console.info(`[SAVE, ${key}] Saved compressed image to ${key}`);
   return true;
 }
-compressOriginalIfNotAlreadyDone = withTrace(
-  compressOriginalIfNotAlreadyDone,
+replaceOriginalIfNotAlreadyDone = withTrace(
+  replaceOriginalIfNotAlreadyDone,
   (_, key) => ({ key }),
-  "2b. compressOriginalIfNotAlreadyDone"
+  "2c. replaceOriginalIfNotAlreadyDone"
 );
 
 async function loadOutfitData(outfitId) {
