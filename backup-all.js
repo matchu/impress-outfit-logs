@@ -6,7 +6,7 @@ const { timeout } = require("promise-timeout");
 const { backupImage, loadOutfitData } = require("./backup-image");
 const LRUCache = require("lru-cache");
 
-const NUM_WORKERS = 20;
+const NUM_WORKERS = 30;
 
 async function main() {
   const s3 = new S3({
