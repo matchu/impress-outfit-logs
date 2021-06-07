@@ -99,13 +99,10 @@ async function main() {
     region: "us-east-1",
   });
 
-  let outfitDataPromise;
-  const getOutfitData = async () => {
-    if (!outfitDataPromise) {
-      outfitDataPromise = loadOutfitData(outfitId);
-    }
-    return await outfitDataPromise;
-  };
+  // NOTE: We preload outfit data, even though we might not end up using it.
+  //       This helps us parallelize things better, to not bottleneck on it!
+  const outfitDataPromise = loadOutfitData(outfitId);
+  const getOutfitData = async () => await outfitDataPromise;
 
   const pid = outfitId.padStart(9, "0");
   const baseKey =
