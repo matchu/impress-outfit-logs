@@ -52,7 +52,7 @@ try {
         fn(...args)
       );
 } catch (e) {
-  trace = () => {};
+  trace = (_, __, fn) => fn();
   withTrace = (fn) => fn;
 }
 
