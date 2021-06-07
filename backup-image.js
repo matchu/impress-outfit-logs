@@ -134,29 +134,41 @@ const FILENAME_TO_SIZE_MAP = {
 };
 
 async function backupImage(s3, key, getOutfitData) {
+  const backupKey = key + ".bkup";
+
+  // NOTE: We preload the compressed image, even if we might not end up
+  //       using it (in the case of an error during backup). This helps us
+  //       parallelize things better, to not bottleneck on it!
+  const originalImagePromise = buildOutfitImage(key, getOutfitData);
+  const compressedImagePromise = originalImagePromise.then(compressImage);
+  const getNewImages = async () => ({
+    originalImage: await originalImagePromise,
+    compressedImage: await compressedImagePromise,
+  });
+
+  // Preload the backup image tagging, too!
+  const backupTaggingPromise = loadImageTagging(s3, backupKey);
+
   const tagging = await loadImageTagging(s3, key);
   if (!tagging) {
     throw new Error(`Image not found`);
   }
 
-  // NOTE: We preload the compressed image, even if we might not end up
-  //       using it (in the case of an error during backup). This helps us
-  //       parallelize things better, to not bottleneck on it!
-  const newImagesPromise = buildNewImagesIfNotAlreadyDone(
+  // First, back up the original image, before touching anything else.
+  const backupTagging = await backupTaggingPromise;
+  const didSaveBackup = await saveBackupIfNotAlreadyDone(
+    s3,
     key,
-    tagging,
-    getOutfitData
+    backupKey,
+    backupTagging
   );
 
-  // First, back up the original image, before touching anything else.
-  const didSaveBackup = await saveBackupIfNotAlreadyDone(s3, key);
-
   // Then, replace it with the new images.
-  const newImages = await newImagesPromise;
   const didReplaceOriginal = await replaceOriginalIfNotAlreadyDone(
     s3,
     key,
-    newImages
+    tagging,
+    getNewImages
   );
 
   // Return whether we made some kind of change, either in the backup
@@ -165,12 +177,8 @@ async function backupImage(s3, key, getOutfitData) {
 }
 backupImage = withTrace(backupImage, (_, key) => ({ key }), "1. backupImage");
 
-async function saveBackupIfNotAlreadyDone(s3, key) {
-  const backupKey = key + ".bkup";
-
+async function saveBackupIfNotAlreadyDone(s3, key, backupKey, backupTagging) {
   if (!force) {
-    const backupTagging = await loadImageTagging(s3, backupKey);
-
     if (backupTagging) {
       if (backupTagging["DTI-Outfit-Image-Kind"] !== "backup") {
         console.warn(
@@ -201,11 +209,11 @@ async function saveBackupIfNotAlreadyDone(s3, key) {
 }
 saveBackupIfNotAlreadyDone = withTrace(
   saveBackupIfNotAlreadyDone,
-  (_, key) => ({ key }),
+  (_, key, backupKey) => ({ key, backupKey }),
   "2a. saveBackupIfNotAlreadyDone"
 );
 
-async function buildNewImagesIfNotAlreadyDone(key, tagging, getOutfitData) {
+async function buildNewImagesIfNotAlreadyDone(key, getOutfitData) {
   if (!force) {
     // Check the tags of the original image. We'll only proceed if there is no
     // DTI-Outfit-Image-Kind tag. (If it's already marked as compressed, then
@@ -239,19 +247,38 @@ async function buildNewImagesIfNotAlreadyDone(key, tagging, getOutfitData) {
 }
 buildNewImagesIfNotAlreadyDone = withTrace(
   buildNewImagesIfNotAlreadyDone,
-  (_, key) => ({ key }),
+  (key) => ({ key }),
   "2b. buildNewImagesIfNotAlreadyDone"
 );
 
-async function replaceOriginalIfNotAlreadyDone(s3, key, newImages) {
-  // `buildNewImageIfNotAlreadyDone` returns `null` if it was already done.
-  // In that case, we skip replacement, and `false` from here to tell the
-  // parent it was already done!
-  if (!newImages) {
-    return false;
+async function replaceOriginalIfNotAlreadyDone(s3, key, tagging, getNewImages) {
+  if (!force) {
+    // Check the tags of the original image. We'll only proceed if there is no
+    // DTI-Outfit-Image-Kind tag. (If it's already marked as compressed, then
+    // we've done this before, and we can skip it! If it's marked with an
+    // unfamiliar tag, show a warning and skip out of caution.)
+    if (!tagging) {
+      throw new Error(`Image not found`);
+    } else if (tagging["DTI-Outfit-Image-Kind"] === "compressed") {
+      console.info(`[CMPR, ${key}] Original is already compressed, skipping`);
+      return null;
+    } else if (tagging["DTI-Outfit-Image-Kind"] === "compression-failed") {
+      console.info(
+        `[CMPR, ${key}] Original previously failed to compress, skipping`
+      );
+      return null;
+    } else if (
+      tagging["DTI-Outfit-Image-Kind"] &&
+      tagging["DTI-Outfit-Image-Kind"] !== "compressed"
+    ) {
+      console.warn(
+        `[WARN, ${key}] Skipping compression, unexpected DTI-Outfit-Image-Kind: ${tagging["DTI-Outfit-Image-Kind"]}`
+      );
+      return null;
+    }
   }
 
-  const { originalImage, compressedImage } = newImages;
+  const { originalImage, compressedImage } = await getNewImages();
 
   const originalSize = originalImage.length;
   const compressedSize = compressedImage.length;
