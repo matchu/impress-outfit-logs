@@ -11,7 +11,8 @@
     "db": "sqlite3 db.sqlite3",
     "backup-image": "node backup-image.js",
     "backup-image-trace": "node --expose-internals --trace-event-categories v8,app backup-image.js 894911 --force",
-    "backup-all": "node backup-all.js"
+    "backup-all": "node backup-all.js",
+    "delete-all-tags": "node delete-all-tags.js"
   },
   "dependencies": {
     "aws-sdk": "^2.920.0",
